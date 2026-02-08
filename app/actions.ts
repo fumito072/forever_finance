@@ -1,6 +1,5 @@
 'use server'
 
-import { VertexAI } from "@google-cloud/vertexai";
 import { google } from "googleapis";
 import { Readable } from "stream";
 
@@ -11,37 +10,53 @@ const GOOGLE_LOCATION = process.env.GOOGLE_LOCATION || 'asia-northeast1';
 const ROOT_FOLDER_ID = process.env.DRIVE_ROOT_FOLDER_ID!;
 
 // サービスアカウント認証（Drive & Vertex AI 共通）
-const credentials = {
-  client_email: GOOGLE_CLIENT_EMAIL,
-  private_key: GOOGLE_PRIVATE_KEY,
-};
-
-// Drive API Auth
-const driveAuth = new google.auth.GoogleAuth({
-  credentials,
-  scopes: ['https://www.googleapis.com/auth/drive'],
-});
-const drive = google.drive({ version: 'v3', auth: driveAuth });
-
-// Vertex AI Auth（サービスアカウントでトークン取得）
-const vertexAuth = new google.auth.GoogleAuth({
-  credentials,
-  scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+const jwtClient = new google.auth.JWT({
+  email: GOOGLE_CLIENT_EMAIL,
+  key: GOOGLE_PRIVATE_KEY,
+  scopes: [
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/cloud-platform',
+  ],
 });
 
-const vertexAI = new VertexAI({
-  project: GOOGLE_PROJECT_ID,
-  location: GOOGLE_LOCATION,
-  googleAuthOptions: {
-    authClient: vertexAuth as never,
-  },
-});
+// Drive API
+const drive = google.drive({ version: 'v3', auth: jwtClient });
 
-// 速度優先でFlashモデルを使用
-const model = vertexAI.getGenerativeModel({
-  model: "gemini-2.5-flash",
-  generationConfig: { responseMimeType: "application/json" },
-});
+// Vertex AI Gemini を REST API で呼び出す
+async function callGemini(prompt: string, imageBase64: string, mimeType: string) {
+  const accessToken = (await jwtClient.getAccessToken()).token;
+  const url = `https://${GOOGLE_LOCATION}-aiplatform.googleapis.com/v1/projects/${GOOGLE_PROJECT_ID}/locations/${GOOGLE_LOCATION}/publishers/google/models/gemini-2.5-flash:generateContent`;
+  
+  const body = {
+    contents: [{
+      role: 'user',
+      parts: [
+        { text: prompt },
+        { inlineData: { data: imageBase64, mimeType } }
+      ]
+    }],
+    generationConfig: { responseMimeType: "application/json" },
+  };
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Vertex AI error (${res.status}): ${err}`);
+  }
+
+  const json = await res.json();
+  const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) throw new Error("AIからの応答が空です");
+  return JSON.parse(text);
+}
 
 export async function processReceipt(formData: FormData) {
   const file = formData.get("file") as File;
@@ -60,19 +75,7 @@ export async function processReceipt(formData: FormData) {
       - vendor: 店名 (短く)
       - category: [会議費, 交通費, 接待交際費, 消耗品費, 通信費, その他] から最適なのを選択`;
     
-    const result = await model.generateContent({
-      contents: [{
-        role: 'user',
-        parts: [
-          { text: prompt },
-          { inlineData: { data: buffer.toString("base64"), mimeType: file.type } }
-        ]
-      }]
-    });
-    
-    const responseText = result.response?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!responseText) throw new Error("AIからの応答が空です");
-    const data = JSON.parse(responseText);
+    const data = await callGemini(prompt, buffer.toString("base64"), file.type);
     console.log("AI Result:", data);
 
     // パス情報の生成

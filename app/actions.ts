@@ -1,31 +1,46 @@
 'use server'
 
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { VertexAI } from "@google-cloud/vertexai";
 import { google } from "googleapis";
 import { Readable } from "stream";
 
-const GEN_AI_KEY = process.env.GEMINI_API_KEY!;
 const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL!;
-// .envの形式に関わらず改行を正しく処理
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY!.replace(/\\n/g, '\n');
+const GOOGLE_PROJECT_ID = process.env.GOOGLE_PROJECT_ID!;
+const GOOGLE_LOCATION = process.env.GOOGLE_LOCATION || 'asia-northeast1';
 const ROOT_FOLDER_ID = process.env.DRIVE_ROOT_FOLDER_ID!;
 
+// サービスアカウント認証（Drive & Vertex AI 共通）
+const credentials = {
+  client_email: GOOGLE_CLIENT_EMAIL,
+  private_key: GOOGLE_PRIVATE_KEY,
+};
+
 // Drive API Auth
-const auth = new google.auth.GoogleAuth({
-  credentials: {
-    client_email: GOOGLE_CLIENT_EMAIL,
-    private_key: GOOGLE_PRIVATE_KEY,
-  },
+const driveAuth = new google.auth.GoogleAuth({
+  credentials,
   scopes: ['https://www.googleapis.com/auth/drive'],
 });
-const drive = google.drive({ version: 'v3', auth });
+const drive = google.drive({ version: 'v3', auth: driveAuth });
 
-// Gemini Auth
-const genAI = new GoogleGenerativeAI(GEN_AI_KEY);
+// Vertex AI Auth（サービスアカウントでトークン取得）
+const vertexAuth = new google.auth.GoogleAuth({
+  credentials,
+  scopes: ['https://www.googleapis.com/auth/cloud-platform'],
+});
+
+const vertexAI = new VertexAI({
+  project: GOOGLE_PROJECT_ID,
+  location: GOOGLE_LOCATION,
+  googleAuthOptions: {
+    authClient: vertexAuth as never,
+  },
+});
+
 // 速度優先でFlashモデルを使用
-const model = genAI.getGenerativeModel({
+const model = vertexAI.getGenerativeModel({
   model: "gemini-2.5-flash",
-  generationConfig: { responseMimeType: "application/json" }
+  generationConfig: { responseMimeType: "application/json" },
 });
 
 export async function processReceipt(formData: FormData) {
@@ -37,7 +52,7 @@ export async function processReceipt(formData: FormData) {
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    // 1. Geminiで解析
+    // 1. Vertex AI Geminiで解析
     const prompt = `この領収書画像を解析し、JSONを返して。
       keys:
       - date: YYYY-MM-DD (不明なら今日)
@@ -45,12 +60,19 @@ export async function processReceipt(formData: FormData) {
       - vendor: 店名 (短く)
       - category: [会議費, 交通費, 接待交際費, 消耗品費, 通信費, その他] から最適なのを選択`;
     
-    const result = await model.generateContent([
-      prompt,
-      { inlineData: { data: buffer.toString("base64"), mimeType: file.type } }
-    ]);
+    const result = await model.generateContent({
+      contents: [{
+        role: 'user',
+        parts: [
+          { text: prompt },
+          { inlineData: { data: buffer.toString("base64"), mimeType: file.type } }
+        ]
+      }]
+    });
     
-    const data = JSON.parse(result.response.text());
+    const responseText = result.response?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!responseText) throw new Error("AIからの応答が空です");
+    const data = JSON.parse(responseText);
     console.log("AI Result:", data);
 
     // パス情報の生成

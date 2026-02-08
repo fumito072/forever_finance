@@ -22,10 +22,9 @@ const jwtClient = new google.auth.JWT({
 // Drive API
 const drive = google.drive({ version: 'v3', auth: jwtClient });
 
-// Vertex AI Gemini を REST API で呼び出す
+// Vertex AI Gemini を REST API で呼び出す（リトライ付き）
 async function callGemini(prompt: string, imageBase64: string, mimeType: string) {
   const accessToken = (await jwtClient.getAccessToken()).token;
-  const url = `https://${GOOGLE_LOCATION}-aiplatform.googleapis.com/v1/projects/${GOOGLE_PROJECT_ID}/locations/${GOOGLE_LOCATION}/publishers/google/models/gemini-2.5-flash:generateContent`;
   
   const body = {
     contents: [{
@@ -38,24 +37,39 @@ async function callGemini(prompt: string, imageBase64: string, mimeType: string)
     generationConfig: { responseMimeType: "application/json" },
   };
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-  });
+  // リトライ: 429の場合は待ってから再試行（最大3回）
+  const maxRetries = 3;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const url = `https://${GOOGLE_LOCATION}-aiplatform.googleapis.com/v1/projects/${GOOGLE_PROJECT_ID}/locations/${GOOGLE_LOCATION}/publishers/google/models/gemini-2.5-flash:generateContent`;
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Vertex AI error (${res.status}): ${err}`);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (res.status === 429 && attempt < maxRetries - 1) {
+      const waitSec = (attempt + 1) * 5; // 5秒, 10秒, 15秒
+      console.log(`Rate limited, retrying in ${waitSec}s... (attempt ${attempt + 1}/${maxRetries})`);
+      await new Promise(r => setTimeout(r, waitSec * 1000));
+      continue;
+    }
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Vertex AI error (${res.status}): ${err}`);
+    }
+
+    const json = await res.json();
+    const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) throw new Error("AIからの応答が空です");
+    return JSON.parse(text);
   }
 
-  const json = await res.json();
-  const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error("AIからの応答が空です");
-  return JSON.parse(text);
+  throw new Error("リトライ上限に達しました");
 }
 
 export async function processReceipt(formData: FormData) {

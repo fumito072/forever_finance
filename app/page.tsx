@@ -3,8 +3,8 @@
 import { useState, useCallback } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { toast, Toaster } from 'react-hot-toast';
-import { processReceipt, type ReceiptData } from './actions';
-import { Loader2, UploadCloud, Download } from 'lucide-react';
+import { processReceipt, fetchPastReceipts, type ReceiptData } from './actions';
+import { Loader2, UploadCloud, Download, FileSpreadsheet } from 'lucide-react';
 
 // 画像をリサイズ・圧縮してVercelの4.5MBペイロード制限内に収める
 async function compressImage(file: File, maxSizeMB = 3, maxDimension = 2048): Promise<File> {
@@ -51,6 +51,7 @@ async function compressImage(file: File, maxSizeMB = 3, maxDimension = 2048): Pr
 
 export default function Home() {
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isFetchingPast, setIsFetchingPast] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [receiptResults, setReceiptResults] = useState<ReceiptData[]>([]);
 
@@ -71,6 +72,30 @@ export default function Home() {
     a.click();
     URL.revokeObjectURL(url);
   }, [receiptResults]);
+
+  // 過去データをDriveから取得してCSV出力
+  const fetchPastData = useCallback(async () => {
+    setIsFetchingPast(true);
+    setLogs(['📂 Driveから過去データを取得中...']);
+    setReceiptResults([]);
+    try {
+      const result = await fetchPastReceipts();
+      if (result.success) {
+        setReceiptResults(result.results);
+        setLogs(prev => [...prev, `✅ ${result.message}`]);
+        toast.success(result.message);
+      } else {
+        setLogs(prev => [...prev, `❌ ${result.message}`]);
+        toast.error(result.message);
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'エラー';
+      setLogs(prev => [...prev, `❌ ${msg}`]);
+      toast.error(msg);
+    } finally {
+      setIsFetchingPast(false);
+    }
+  }, []);
 
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
     if (acceptedFiles.length === 0) return;
@@ -159,6 +184,20 @@ export default function Home() {
             </p>
           )}
         </div>
+
+        {/* 過去データCSV出力ボタン */}
+        <button
+          onClick={fetchPastData}
+          disabled={isProcessing || isFetchingPast}
+          className="mt-4 w-full flex items-center justify-center gap-2 py-2.5 px-4 bg-gray-700 hover:bg-gray-600 disabled:opacity-50 disabled:cursor-not-allowed text-gray-200 text-sm font-medium rounded-lg border border-gray-600 transition-all"
+        >
+          {isFetchingPast ? (
+            <Loader2 className="w-4 h-4 animate-spin" />
+          ) : (
+            <FileSpreadsheet className="w-4 h-4" />
+          )}
+          過去データをCSV出力
+        </button>
 
         {logs.length > 0 && (
           <div className="mt-6 p-4 bg-black/30 rounded-lg text-sm h-48 overflow-y-auto font-mono">

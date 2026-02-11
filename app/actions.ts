@@ -315,3 +315,105 @@ async function resolveCategoryFolder(category: string, parentId: string) {
   const available = folders.map((f) => f.name).filter(Boolean).join(', ');
   throw new Error(`カテゴリフォルダが見つかりません: ${category}. 利用可能: ${available}`);
 }
+
+// ── 過去データ取得：Driveのファイル名からCSV用データを復元 ──
+
+// フォルダ配下の全ファイルを再帰的に取得
+async function listAllFiles(folderId: string, category?: string): Promise<ReceiptData[]> {
+  const results: ReceiptData[] = [];
+
+  // サブフォルダを取得
+  const subFolders = await listChildFolders(folderId);
+
+  // ファイルを取得
+  const q = `'${folderId}' in parents and mimeType!='application/vnd.google-apps.folder' and trashed=false`;
+  let pageToken: string | undefined;
+  do {
+    const res = await drive.files.list({
+      q,
+      fields: 'nextPageToken, files(id,name,createdTime)',
+      pageSize: 100,
+      pageToken,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      corpora: 'allDrives',
+    });
+
+    for (const file of res.data.files ?? []) {
+      const parsed = parseFileName(file.name ?? '', category);
+      if (parsed) results.push(parsed);
+    }
+    pageToken = res.data.nextPageToken ?? undefined;
+  } while (pageToken);
+
+  // サブフォルダを再帰的にスキャン（フォルダ名をカテゴリとして渡す）
+  for (const folder of subFolders) {
+    const subResults = await listAllFiles(folder.id!, folder.name ?? category);
+    results.push(...subResults);
+  }
+
+  return results;
+}
+
+// ファイル名パーサー: "2025-10-23_交通費_ENEOS.jpg" → { date, amount, vendor, category, fileName }
+function parseFileName(fileName: string, folderCategory?: string): ReceiptData | null {
+  // パターン1: YYYY-MM-DD_カテゴリ_店名.ext
+  const match = fileName.match(/^(\d{4}-\d{2}-\d{2})_([^_]+)_(.+)\.\w+$/);
+  if (match) {
+    return {
+      date: match[1],
+      amount: 0, // ファイル名に金額情報がないため0
+      vendor: match[3],
+      category: match[2],
+      fileName,
+    };
+  }
+
+  // パターン2: それ以外のファイル（フォルダ名をカテゴリとして使用）
+  if (folderCategory) {
+    return {
+      date: '',
+      amount: 0,
+      vendor: fileName.replace(/\.\w+$/, ''),
+      category: folderCategory,
+      fileName,
+    };
+  }
+
+  return null;
+}
+
+export async function fetchPastReceipts(): Promise<{
+  success: boolean;
+  message: string;
+  results: ReceiptData[];
+}> {
+  try {
+    console.log('[過去データ] スキャン開始...');
+    const allResults: ReceiptData[] = [];
+
+    // ルートフォルダ直下のフォルダを取得
+    const topFolders = await listChildFolders(ROOT_FOLDER_ID);
+    console.log(`[過去データ] ${topFolders.length}個のフォルダを検出`);
+
+    for (const folder of topFolders) {
+      console.log(`[過去データ] スキャン中: ${folder.name}`);
+      const folderResults = await listAllFiles(folder.id!, folder.name ?? undefined);
+      allResults.push(...folderResults);
+    }
+
+    // 日付の降順でソート
+    allResults.sort((a, b) => b.date.localeCompare(a.date));
+
+    console.log(`[過去データ] 完了: ${allResults.length}件`);
+    return {
+      success: true,
+      message: `${allResults.length}件のデータを取得しました`,
+      results: allResults,
+    };
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : 'エラーが発生しました';
+    console.error('[過去データ] エラー:', msg);
+    return { success: false, message: msg, results: [] };
+  }
+}

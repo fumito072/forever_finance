@@ -3,11 +3,13 @@
 import { useState, useCallback } from 'react';
 import { useDropzone } from 'react-dropzone';
 import { toast, Toaster } from 'react-hot-toast';
-import { processReceipt } from './actions';
-import { Loader2, UploadCloud } from 'lucide-react';
+import { processReceipt, type ReceiptData } from './actions';
+import { Loader2, UploadCloud, Download } from 'lucide-react';
 
 // 画像をリサイズ・圧縮してVercelの4.5MBペイロード制限内に収める
 async function compressImage(file: File, maxSizeMB = 3, maxDimension = 2048): Promise<File> {
+  // PDFはそのまま返す（サーバー側で処理）
+  if (file.type === 'application/pdf') return file;
   // 既に十分小さい場合はそのまま返す
   if (file.size <= maxSizeMB * 1024 * 1024) return file;
 
@@ -50,14 +52,32 @@ async function compressImage(file: File, maxSizeMB = 3, maxDimension = 2048): Pr
 export default function Home() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
+  const [receiptResults, setReceiptResults] = useState<ReceiptData[]>([]);
 
+  // CSV生成＆ダウンロード
+  const downloadCsv = useCallback(() => {
+    if (receiptResults.length === 0) return;
+    const header = '日付,金額,店名,カテゴリ,ファイル名';
+    const rows = receiptResults.map(r =>
+      `${r.date},${r.amount},"${r.vendor}","${r.category}","${r.fileName}"`
+    );
+    const csv = '\uFEFF' + [header, ...rows].join('\n'); // BOM付きでExcel対応
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const today = new Date().toISOString().split('T')[0];
+    a.download = `経費一覧_${today}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [receiptResults]);
 
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
     if (acceptedFiles.length === 0) return;
     setIsProcessing(true);
     setLogs([]);
+    setReceiptResults([]);
     try {
-      // Vercelのタイムアウト対策のため、1ファイルずつ直列に処理するVibe
       for (const file of acceptedFiles) {
         setLogs(prev => [...prev, `🔄 処理開始: ${file.name} (${(file.size / 1024 / 1024).toFixed(1)}MB)...`]);
 
@@ -76,12 +96,17 @@ export default function Home() {
         formData.append('file', uploadFile);
 
         try {
-          // Server Action呼び出し（長引いた場合でもUIが固まらないようタイムアウト）
           const result = await processReceipt(formData);
 
           if (result.success) {
             toast.success(result.message);
             setLogs(prev => [...prev, `✅ 完了: ${result.message}`]);
+            // 結果データを蓄積（PDF複数ページ or 画像単体）
+            if (result.results) {
+              setReceiptResults(prev => [...prev, ...result.results!]);
+            } else if (result.data) {
+              setReceiptResults(prev => [...prev, result.data!]);
+            }
           } else {
             toast.error(`失敗: ${file.name}`);
             setLogs(prev => [...prev, `❌ エラー: ${file.name} - ${result.message}`]);
@@ -100,7 +125,7 @@ export default function Home() {
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
-    accept: { 'image/*': [] },
+    accept: { 'image/*': [], 'application/pdf': ['.pdf'] },
     disabled: isProcessing
   });
 
@@ -129,7 +154,7 @@ export default function Home() {
             <p className="text-blue-400 font-medium">ここに領収書をドロップ！</p>
           ) : (
             <p className="text-gray-300 text-center">
-              領収書画像をドラッグ＆ドロップ<br />
+              領収書画像・PDFをドラッグ＆ドロップ<br />
               <span className="text-sm text-gray-500">またはクリックして選択</span>
             </p>
           )}
@@ -140,6 +165,41 @@ export default function Home() {
             {logs.map((log, i) => (
               <div key={i} className="mb-1">{log}</div>
             ))}
+          </div>
+        )}
+
+        {/* CSV出力ボタン＆結果テーブル */}
+        {receiptResults.length > 0 && (
+          <div className="mt-4">
+            <button
+              onClick={downloadCsv}
+              className="w-full flex items-center justify-center gap-2 py-3 px-4 bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700 text-white font-bold rounded-lg transition-all"
+            >
+              <Download className="w-5 h-5" />
+              CSV出力（{receiptResults.length}件）
+            </button>
+            <div className="mt-3 overflow-x-auto">
+              <table className="w-full text-xs text-left">
+                <thead className="text-gray-400 border-b border-gray-700">
+                  <tr>
+                    <th className="py-1 pr-2">日付</th>
+                    <th className="py-1 pr-2 text-right">金額</th>
+                    <th className="py-1 pr-2">店名</th>
+                    <th className="py-1">カテゴリ</th>
+                  </tr>
+                </thead>
+                <tbody className="text-gray-300">
+                  {receiptResults.map((r, i) => (
+                    <tr key={i} className="border-b border-gray-800">
+                      <td className="py-1 pr-2">{r.date}</td>
+                      <td className="py-1 pr-2 text-right">¥{r.amount.toLocaleString()}</td>
+                      <td className="py-1 pr-2 truncate max-w-[100px]">{r.vendor}</td>
+                      <td className="py-1">{r.category}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         )}
       </div>

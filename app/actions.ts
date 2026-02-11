@@ -2,6 +2,7 @@
 
 import { google } from "googleapis";
 import { Readable } from "stream";
+import { pdf } from "pdf-to-img";
 
 const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL!;
 const GOOGLE_PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY!.replace(/\\n/g, '\n');
@@ -88,7 +89,20 @@ async function callGemini(prompt: string, imageBase64: string, mimeType: string)
   throw new Error("リトライ上限に達しました");
 }
 
-export async function processReceipt(formData: FormData) {
+export type ReceiptData = {
+  date: string;
+  amount: number;
+  vendor: string;
+  category: string;
+  fileName: string;
+};
+
+export async function processReceipt(formData: FormData): Promise<{
+  success: boolean;
+  message: string;
+  data?: ReceiptData;
+  results?: ReceiptData[];
+}> {
   const file = formData.get("file") as File;
   if (!file || file.size === 0) return { success: false, message: "ファイルが空です" };
 
@@ -96,7 +110,13 @@ export async function processReceipt(formData: FormData) {
     console.log(`[1/4] Processing: ${file.name}, size: ${file.size} bytes, type: ${file.type}`);
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
-    console.log(`[2/4] Buffer ready: ${buffer.length} bytes, base64 size: ~${Math.round(buffer.length * 1.37)} bytes`);
+
+    // PDFの場合はページごとに処理
+    if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+      return await processPdf(buffer, file.name);
+    }
+
+    console.log(`[2/4] Buffer ready: ${buffer.length} bytes`);
 
     // 1. Vertex AI Geminiで解析
     const prompt = `この領収書画像を解析し、JSONを返して。
@@ -107,7 +127,7 @@ export async function processReceipt(formData: FormData) {
       - category: [会議費, 交通費, 接待交際費, 消耗品費, 通信費, その他] から最適なのを選択`;
     
     console.log(`[2/4] Calling Gemini...`);
-    const data = await callGemini(prompt, buffer.toString("base64"), file.type);
+    const data = await callGemini(prompt, buffer.toString("base64"), file.type || 'image/jpeg');
     console.log("[3/4] AI Result:", data);
 
     // パス情報の生成
@@ -120,12 +140,10 @@ export async function processReceipt(formData: FormData) {
     // 2. ドライブフォルダ準備（既存フォルダのみを使用）
     let parentFolderId: string;
     if (year <= 2025) {
-      // 2025年以前 → "25年までの経費" フォルダに直接格納
       const oldFolder = await findFolder('25年までの経費', ROOT_FOLDER_ID);
       if (!oldFolder) throw new Error('「25年までの経費」フォルダが見つかりません');
       parentFolderId = oldFolder;
     } else {
-      // 2026年以降 → YYMM形式のフォルダ（例: 2601）
       const yy = yyyy.slice(-2);
       const yearMonthFolder = `${yy}${mm}`;
       const monthFolderId = await findFolder(yearMonthFolder, ROOT_FOLDER_ID);
@@ -142,12 +160,20 @@ export async function processReceipt(formData: FormData) {
 
     await drive.files.create({
       requestBody: { name: newFileName, parents: [targetFolderId] },
-      media: { mimeType: file.type, body: stream },
+      media: { mimeType: file.type || 'image/jpeg', body: stream },
       supportsAllDrives: true
     });
     console.log(`[4/4] Saved: ${newFileName}`);
 
-    return { success: true, message: `「${newFileName}」を保存しました！`, data };
+    const receiptData: ReceiptData = {
+      date: dateStr,
+      amount: data.amount ?? 0,
+      vendor: data.vendor ?? '不明',
+      category: categoryFolder,
+      fileName: newFileName,
+    };
+
+    return { success: true, message: `「${newFileName}」を保存しました！`, data: receiptData };
 
   } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : "エラーが発生しました";
@@ -156,6 +182,88 @@ export async function processReceipt(formData: FormData) {
     console.error("Stack:", errorStack);
     return { success: false, message: errorMessage };
   }
+}
+
+// PDF処理：ページごとに画像化 → AI解析 → Driveアップロード
+async function processPdf(pdfBuffer: Buffer, originalName: string): Promise<{
+  success: boolean;
+  message: string;
+  results?: ReceiptData[];
+}> {
+  const results: ReceiptData[] = [];
+  const errors: string[] = [];
+  let pageNum = 0;
+
+  const pages = await pdf(pdfBuffer, { scale: 2.0 });
+  for await (const pageImage of pages) {
+    pageNum++;
+    const pageBuffer = Buffer.from(pageImage);
+    console.log(`[PDF] Page ${pageNum}: ${pageBuffer.length} bytes`);
+
+    try {
+      const prompt = `この領収書画像を解析し、JSONを返して。
+        keys:
+        - date: YYYY-MM-DD (不明なら今日)
+        - amount: 数値
+        - vendor: 店名 (短く)
+        - category: [会議費, 交通費, 接待交際費, 消耗品費, 通信費, その他] から最適なのを選択`;
+
+      const data = await callGemini(prompt, pageBuffer.toString("base64"), 'image/png');
+
+      const dateStr = data.date || new Date().toISOString().split('T')[0];
+      const [yyyy, mm] = dateStr.split('-');
+      const year = parseInt(yyyy, 10);
+      const categoryFolder = data.category || "その他";
+      const baseName = originalName.replace(/\.pdf$/i, '');
+      const newFileName = `${dateStr}_${categoryFolder}_${data.vendor || '不明'}_p${pageNum}.png`;
+
+      let parentFolderId: string;
+      if (year <= 2025) {
+        const oldFolder = await findFolder('25年までの経費', ROOT_FOLDER_ID);
+        if (!oldFolder) throw new Error('「25年までの経費」フォルダが見つかりません');
+        parentFolderId = oldFolder;
+      } else {
+        const yy = yyyy.slice(-2);
+        const yearMonthFolder = `${yy}${mm}`;
+        const monthFolderId = await findFolder(yearMonthFolder, ROOT_FOLDER_ID);
+        if (!monthFolderId) throw new Error(`月フォルダが見つかりません: ${yearMonthFolder}`);
+        parentFolderId = monthFolderId;
+      }
+
+      const targetFolderId = await resolveCategoryFolder(categoryFolder, parentFolderId);
+
+      const stream = new Readable();
+      stream.push(pageBuffer);
+      stream.push(null);
+
+      await drive.files.create({
+        requestBody: { name: newFileName, parents: [targetFolderId] },
+        media: { mimeType: 'image/png', body: stream },
+        supportsAllDrives: true,
+      });
+
+      console.log(`[PDF] Saved page ${pageNum}: ${newFileName}`);
+      results.push({
+        date: dateStr,
+        amount: data.amount ?? 0,
+        vendor: data.vendor ?? '不明',
+        category: categoryFolder,
+        fileName: newFileName,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'エラー';
+      errors.push(`ページ${pageNum}: ${msg}`);
+      console.error(`[PDF] Page ${pageNum} error:`, msg);
+    }
+  }
+
+  if (results.length === 0) {
+    return { success: false, message: `PDF処理失敗: ${errors.join(', ')}` };
+  }
+
+  const msg = `PDF ${pageNum}ページ中${results.length}ページ保存完了` +
+    (errors.length > 0 ? ` (${errors.length}ページ失敗)` : '');
+  return { success: true, message: msg, results };
 }
 
 // 既存フォルダ検索ヘルパー

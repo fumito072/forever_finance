@@ -95,17 +95,27 @@ export async function processReceipt(formData: FormData) {
     // パス情報の生成
     const dateStr = data.date || new Date().toISOString().split('T')[0];
     const [yyyy, mm] = dateStr.split('-');
-    // 和暦短縮形式: 2026年01月 → "2601"
-    const yy = yyyy.slice(-2);
-    const yearMonthFolder = `${yy}${mm}`;
+    const year = parseInt(yyyy, 10);
     const categoryFolder = data.category || "その他";
     const newFileName = `${dateStr}_${categoryFolder}_${data.vendor || '不明'}.jpg`;
 
     // 2. ドライブフォルダ準備（既存フォルダのみを使用）
-    const monthFolderId = await findFolder(yearMonthFolder, ROOT_FOLDER_ID);
-    if (!monthFolderId) throw new Error(`月フォルダが見つかりません: ${yearMonthFolder}`);
+    let parentFolderId: string;
+    if (year <= 2025) {
+      // 2025年以前 → "25年までの経費" フォルダに直接格納
+      const oldFolder = await findFolder('25年までの経費', ROOT_FOLDER_ID);
+      if (!oldFolder) throw new Error('「25年までの経費」フォルダが見つかりません');
+      parentFolderId = oldFolder;
+    } else {
+      // 2026年以降 → YYMM形式のフォルダ（例: 2601）
+      const yy = yyyy.slice(-2);
+      const yearMonthFolder = `${yy}${mm}`;
+      const monthFolderId = await findFolder(yearMonthFolder, ROOT_FOLDER_ID);
+      if (!monthFolderId) throw new Error(`月フォルダが見つかりません: ${yearMonthFolder}`);
+      parentFolderId = monthFolderId;
+    }
 
-    const targetFolderId = await resolveCategoryFolder(categoryFolder, monthFolderId);
+    const targetFolderId = await resolveCategoryFolder(categoryFolder, parentFolderId);
 
     // 3. アップロード
     const stream = new Readable();

@@ -25,6 +25,10 @@ const drive = google.drive({ version: 'v3', auth: jwtClient });
 // Vertex AI Gemini を REST API で呼び出す（リトライ付き）
 async function callGemini(prompt: string, imageBase64: string, mimeType: string) {
   const accessToken = (await jwtClient.getAccessToken()).token;
+  const fallbackLocation = process.env.GOOGLE_LOCATION_FALLBACK;
+  const locations = [GOOGLE_LOCATION, fallbackLocation, 'us-central1']
+    .filter((v): v is string => Boolean(v))
+    .filter((v, i, arr) => arr.indexOf(v) === i);
   
   const body = {
     contents: [{
@@ -37,36 +41,48 @@ async function callGemini(prompt: string, imageBase64: string, mimeType: string)
     generationConfig: { responseMimeType: "application/json" },
   };
 
-  // リトライ: 429の場合は待ってから再試行（最大3回）
-  const maxRetries = 3;
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    const url = `https://${GOOGLE_LOCATION}-aiplatform.googleapis.com/v1/projects/${GOOGLE_PROJECT_ID}/locations/${GOOGLE_LOCATION}/publishers/google/models/gemini-2.5-flash:generateContent`;
+  // リトライ: 429の場合のみ短い待機＋リージョン切替（Vercelの実行時間上限を超えないように）
+  const maxAttempts = 2;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    let last429Text: string | null = null;
 
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
-    });
+    for (const location of locations) {
+      const url = `https://${location}-aiplatform.googleapis.com/v1/projects/${GOOGLE_PROJECT_ID}/locations/${location}/publishers/google/models/gemini-2.5-flash:generateContent`;
 
-    if (res.status === 429 && attempt < maxRetries - 1) {
-      const waitSec = (attempt + 1) * 5; // 5秒, 10秒, 15秒
-      console.log(`Rate limited, retrying in ${waitSec}s... (attempt ${attempt + 1}/${maxRetries})`);
-      await new Promise(r => setTimeout(r, waitSec * 1000));
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (res.status === 429) {
+        last429Text = await res.text();
+        continue;
+      }
+
+      if (!res.ok) {
+        const err = await res.text();
+        throw new Error(`Vertex AI error (${res.status}): ${err}`);
+      }
+
+      const json = await res.json();
+      const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!text) throw new Error('AIからの応答が空です');
+      return JSON.parse(text);
+    }
+
+    // どのリージョンでも429だった場合のみ待機して再試行
+    if (attempt < maxAttempts - 1) {
+      const waitMs = 800 * (attempt + 1);
+      console.log(`Rate limited, retrying in ${waitMs}ms... (attempt ${attempt + 1}/${maxAttempts})`);
+      await new Promise((r) => setTimeout(r, waitMs));
       continue;
     }
 
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`Vertex AI error (${res.status}): ${err}`);
-    }
-
-    const json = await res.json();
-    const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error("AIからの応答が空です");
-    return JSON.parse(text);
+    throw new Error(`Vertex AI error (429): ${last429Text ?? 'Resource exhausted'}`);
   }
 
   throw new Error("リトライ上限に達しました");

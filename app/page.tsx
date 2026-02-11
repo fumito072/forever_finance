@@ -10,30 +10,45 @@ export default function Home() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
 
+  const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number) => {
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('タイムアウトしました')), timeoutMs);
+    });
+    return Promise.race([promise, timeoutPromise]);
+  };
+
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
     if (acceptedFiles.length === 0) return;
     setIsProcessing(true);
     setLogs([]);
-    
-    // Vercelのタイムアウト対策のため、1ファイルずつ直列に処理するVibe
-    for (const file of acceptedFiles) {
-      setLogs(prev => [...prev, `🔄 処理開始: ${file.name}...`]);
-      const formData = new FormData();
-      formData.append("file", file);
-      
-      // Server Action呼び出し
-      const result = await processReceipt(formData);
-      
-      if (result.success) {
-        toast.success(result.message);
-        setLogs(prev => [...prev, `✅ 完了: ${result.message}`]);
-      } else {
-        toast.error(`失敗: ${file.name}`);
-        setLogs(prev => [...prev, `❌ エラー: ${file.name} - ${result.message}`]);
+    try {
+      // Vercelのタイムアウト対策のため、1ファイルずつ直列に処理するVibe
+      for (const file of acceptedFiles) {
+        setLogs(prev => [...prev, `🔄 処理開始: ${file.name}...`]);
+        const formData = new FormData();
+        formData.append('file', file);
+
+        try {
+          // Server Action呼び出し（長引いた場合でもUIが固まらないようタイムアウト）
+          const result = await withTimeout(processReceipt(formData), 25_000);
+
+          if (result.success) {
+            toast.success(result.message);
+            setLogs(prev => [...prev, `✅ 完了: ${result.message}`]);
+          } else {
+            toast.error(`失敗: ${file.name}`);
+            setLogs(prev => [...prev, `❌ エラー: ${file.name} - ${result.message}`]);
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : 'エラーが発生しました';
+          toast.error(`失敗: ${file.name}`);
+          setLogs(prev => [...prev, `❌ エラー: ${file.name} - ${msg}`]);
+        }
       }
+    } finally {
+      setIsProcessing(false);
+      setLogs(prev => [...prev, `🎉 全ファイルの処理が完了しました！`]);
     }
-    setIsProcessing(false);
-    setLogs(prev => [...prev, `🎉 全ファイルの処理が完了しました！`]);
   }, []);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({

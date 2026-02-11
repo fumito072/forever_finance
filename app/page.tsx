@@ -10,12 +10,6 @@ export default function Home() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [logs, setLogs] = useState<string[]>([]);
 
-  const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number) => {
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error('タイムアウトしました')), timeoutMs);
-    });
-    return Promise.race([promise, timeoutPromise]);
-  };
 
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
     if (acceptedFiles.length === 0) return;
@@ -30,7 +24,7 @@ export default function Home() {
 
         try {
           // Server Action呼び出し（長引いた場合でもUIが固まらないようタイムアウト）
-          const result = await withTimeout(processReceipt(formData), 25_000);
+          const result = await processReceipt(formData);
 
           if (result.success) {
             toast.success(result.message);

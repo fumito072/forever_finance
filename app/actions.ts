@@ -93,9 +93,10 @@ export async function processReceipt(formData: FormData) {
   if (!file || file.size === 0) return { success: false, message: "ファイルが空です" };
 
   try {
-    console.log(`Processing: ${file.name}`);
+    console.log(`[1/4] Processing: ${file.name}, size: ${file.size} bytes, type: ${file.type}`);
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
+    console.log(`[2/4] Buffer ready: ${buffer.length} bytes, base64 size: ~${Math.round(buffer.length * 1.37)} bytes`);
 
     // 1. Vertex AI Geminiで解析
     const prompt = `この領収書画像を解析し、JSONを返して。
@@ -105,8 +106,9 @@ export async function processReceipt(formData: FormData) {
       - vendor: 店名 (短く)
       - category: [会議費, 交通費, 接待交際費, 消耗品費, 通信費, その他] から最適なのを選択`;
     
+    console.log(`[2/4] Calling Gemini...`);
     const data = await callGemini(prompt, buffer.toString("base64"), file.type);
-    console.log("AI Result:", data);
+    console.log("[3/4] AI Result:", data);
 
     // パス情報の生成
     const dateStr = data.date || new Date().toISOString().split('T')[0];
@@ -143,13 +145,15 @@ export async function processReceipt(formData: FormData) {
       media: { mimeType: file.type, body: stream },
       supportsAllDrives: true
     });
-    console.log(`Saved: ${newFileName}`);
+    console.log(`[4/4] Saved: ${newFileName}`);
 
     return { success: true, message: `「${newFileName}」を保存しました！`, data };
 
   } catch (error: unknown) {
     const errorMessage = error instanceof Error ? error.message : "エラーが発生しました";
+    const errorStack = error instanceof Error ? error.stack : '';
     console.error("Error:", errorMessage);
+    console.error("Stack:", errorStack);
     return { success: false, message: errorMessage };
   }
 }
